@@ -1,14 +1,21 @@
 """
-Parse text from numbered JPG images in source/, with multi-column detection.
-Outputs a single Markdown file in reading order.
+Extract text from scanned magazine page images using a hybrid approach:
+1. Tesseract OCR for accurate word-level text
+2. Claude vision for layout understanding (titles, columns, pull quotes, captions)
 
-Uses Tesseract's own block/paragraph/line structure for layout analysis
-rather than a custom histogram, which handles multi-column pages reliably.
+Sends both the image and raw OCR text to Claude, which uses the image to
+understand the visual structure and the OCR text as the word-accurate source.
 """
 
+import base64
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import pytesseract
@@ -21,6 +28,49 @@ except ImportError as e:
 
 SOURCE_DIR = Path("source")
 OUTPUT_FILE = Path("output.md")
+
+EXTRACTION_PROMPT = """\
+You are extracting text from a scanned magazine page. I am providing:
+1. The actual page image so you can see the visual layout.
+2. Raw OCR text from Tesseract, which has accurate words but wrong reading \
+order and no structural understanding.
+
+Your job is to combine both: use the IMAGE to understand the layout and \
+structure, and use the OCR TEXT as the authoritative source for the actual \
+words (since your vision may misread small print). Fix obvious OCR spelling \
+errors using context.
+
+Rules:
+1. **Reading order**: Read columns left-to-right, top-to-bottom. If there \
+are 3 columns, output the left column fully, then middle, then right. \
+Within each column, go top-to-bottom.
+2. **Title/subtitle**: If the page has a large title or subtitle at the top, \
+put it first as a Markdown heading (# or ##). The subtitle should be in italics.
+3. **Pull quotes**: Large decorative quotes displayed prominently on the page \
+that REPEAT text already in the body—output these ONCE as a blockquote \
+(> ...) placed after the paragraph they appear near. Do not duplicate the text.
+4. **Photo captions**: Italic captions below photos—put at the end as: \
+> *Caption: "text here"*
+5. **Photo credits**: E.g. "PHOTOGRAPHY BY ..."—put at the end as: \
+*Photo credit: ...*
+6. **Interview format**: Format dialogue as:\
+\n   **PLAYBOY:** Question text\
+\n   **MAXWELL:** Answer text\
+\n   Use bold for ALL speaker labels (PLAYBOY, MAXWELL, GUARD, OFFICER, \
+EDITOR, etc.). Keep stage directions in [square brackets] as-is, in italics.
+7. **Page numbers**: Omit entirely.
+8. **Margin text**: Ignore "PLAYBOY" running vertically along the page margin.
+9. **Hyphenation**: Rejoin words split across lines (e.g. "news-paper" → \
+"newspaper"), but keep real hyphens (e.g. "well-stocked").
+10. **Spelling**: Fix OCR errors (e.g. "wnotent"→"violent", "fuzure"→"figure", \
+"lave"→"love") but preserve the author's original wording. Do not rephrase.
+11. Output ONLY the Markdown text. No commentary, no preamble.
+
+Here is the raw OCR text for reference:
+
+---
+{ocr_text}
+---"""
 
 
 def get_sorted_image_paths():
@@ -49,21 +99,19 @@ def check_tesseract():
         sys.exit(1)
 
 
-def extract_page_text(image_path):
+def tesseract_extract(image_path: Path) -> str:
     """
-    OCR one image. Uses Tesseract's block/par/line/word structure to preserve
-    reading order across columns. Blocks are sorted by a reading heuristic
-    (column-first: left-to-right within similar vertical bands, then top-to-bottom).
+    Run Tesseract with block-aware ordering: use block_num structure,
+    sort blocks into columns (left third, middle, right), then emit
+    lines in reading order. Returns raw text.
     """
     img = Image.open(image_path).convert("RGB")
     img_width, _ = img.size
     data = pytesseract.image_to_data(img, output_type=Output.DICT)
     n = len(data["text"])
 
-    # Group words by (block_num, par_num, line_num)
-    # and track block-level bounding boxes for sorting blocks.
-    block_bbox = {}          # block_num -> (min_left, min_top, max_right, max_bottom)
-    lines = defaultdict(list)  # (block_num, par_num, line_num) -> [(word_num, left, text)]
+    block_bbox = {}
+    lines = defaultdict(list)
 
     for i in range(n):
         text = (data["text"][i] or "").strip()
@@ -71,12 +119,12 @@ def extract_page_text(image_path):
             continue
         blk = data["block_num"][i]
         par = data["par_num"][i]
-        ln  = data["line_num"][i]
-        wn  = data["word_num"][i]
+        ln = data["line_num"][i]
+        wn = data["word_num"][i]
         left = data["left"][i]
-        top  = data["top"][i]
-        w    = data["width"][i]
-        h    = data["height"][i]
+        top = data["top"][i]
+        w = data["width"][i]
+        h = data["height"][i]
 
         lines[(blk, par, ln)].append((wn, left, text))
 
@@ -92,10 +140,6 @@ def extract_page_text(image_path):
     if not lines:
         return ""
 
-    # Sort blocks into reading order.
-    # Heuristic: assign each block to a "column" based on whether its
-    # horizontal center is in the left, middle, or right third of the page,
-    # then sort by (column_index, top).
     def block_sort_key(blk_num):
         bb = block_bbox[blk_num]
         x_center = (bb[0] + bb[2]) / 2
@@ -105,8 +149,6 @@ def extract_page_text(image_path):
 
     sorted_blocks = sorted(block_bbox.keys(), key=block_sort_key)
 
-    # Build ordered text: iterate blocks in reading order,
-    # then paragraphs and lines within each block in natural order.
     page_parts = []
     for blk in sorted_blocks:
         block_lines = {k: v for k, v in lines.items() if k[0] == blk}
@@ -114,16 +156,55 @@ def extract_page_text(image_path):
             continue
         for key in sorted(block_lines.keys()):
             words = block_lines[key]
-            words.sort(key=lambda w: (w[0], w[1]))  # word_num then left
+            words.sort(key=lambda w: (w[0], w[1]))
             line_text = " ".join(w[2] for w in words)
             page_parts.append(line_text)
-        page_parts.append("")  # blank line between blocks
+        page_parts.append("")
 
     return "\n".join(page_parts).strip()
 
 
+def image_to_base64(path: Path) -> str:
+    return base64.standard_b64encode(path.read_bytes()).decode("utf-8")
+
+
+def extract_page(client, image_path: Path, ocr_text: str) -> str:
+    b64 = image_to_base64(image_path)
+    prompt = EXTRACTION_PROMPT.replace("{ocr_text}", ocr_text)
+    resp = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=8192,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    )
+    return resp.content[0].text.strip()
+
+
 def main():
+    import anthropic
+
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        print("ANTHROPIC_API_KEY not set in .env", file=sys.stderr)
+        sys.exit(1)
+
     check_tesseract()
+    client = anthropic.Anthropic(api_key=key)
+
     paths = get_sorted_image_paths()
     if not paths:
         print("No JPG files found in", SOURCE_DIR, file=sys.stderr)
@@ -131,16 +212,17 @@ def main():
 
     parts = []
     for i, path in enumerate(paths, start=1):
-        print(f"  Processing page {i}: {path.name} ...")
-        page_md = extract_page_text(path)
+        print(f"  [{i}/{len(paths)}] Tesseract OCR: {path.name} ...")
+        ocr_text = tesseract_extract(path)
+        print(f"  [{i}/{len(paths)}] Claude layout + cleanup ...")
+        page_md = extract_page(client, path, ocr_text)
         if parts:
-            parts.append("\n\n---\n\n## Page {}\n\n".format(i))
-        else:
-            parts.append("## Page 1\n\n")
+            parts.append("\n\n---\n\n")
+        parts.append(f"## Page {i}\n\n")
         parts.append(page_md)
 
-    OUTPUT_FILE.write_text("".join(parts), encoding="utf-8")
-    print("Wrote", OUTPUT_FILE, f"({len(paths)} pages)")
+    OUTPUT_FILE.write_text("\n".join(parts), encoding="utf-8")
+    print(f"\nWrote {OUTPUT_FILE} ({len(paths)} pages)")
 
 
 if __name__ == "__main__":
